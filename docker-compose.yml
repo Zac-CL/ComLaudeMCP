@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  comlaude-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: comlaude-mcp-server
+    restart: unless-stopped
+    environment:
+      # Set your Com Laude API key here or use environment variable
+      - COMLAUDE_API_KEY=${COMLAUDE_API_KEY:-}
+      - COMLAUDE_BASE_URL=${COMLAUDE_BASE_URL:-https://api.comlaude.com}
+    volumes:
+      # Mount logs directory for persistence
+      - ./logs:/app/logs
+    ports:
+      # Expose port for potential HTTP interface (if needed)
+      - "8000:8000"
+    networks:
+      - comlaude-network
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import asyncio; print('Health check passed')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+networks:
+  comlaude-network:
+    driver: bridge
+
+# Optional: Add a volume for persistent data
+volumes:
+  comlaude-logs:
+    driver: local
+

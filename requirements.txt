@@ -1,0 +1,21 @@
+# Core MCP dependencies
+mcp>=1.0.0
+
+# HTTP client for API requests
+httpx>=0.25.0
+
+# Async support
+asyncio-compat>=0.1.2
+
+# JSON handling
+pydantic>=2.0.0
+
+# Logging and utilities
+python-json-logger>=2.0.0
+
+# Development and testing (optional)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+
