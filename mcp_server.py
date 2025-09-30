@@ -7,8 +7,10 @@ Provides access to Com Laude's domain management, SSL, and account services
 import asyncio
 import json
 import logging
+import os
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from mcp.server import Server
@@ -21,7 +23,9 @@ from mcp.types import (
     ListResourcesResult,
     ListToolsRequest,
     ListToolsResult,
+    ReadResourceRequest,
     Resource,
+    ResourceContents,
     TextContent,
     Tool,
 )
@@ -30,42 +34,186 @@ from mcp.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class ComLaudeAPIClient:
-    """Client for Com Laude API operations"""
-    
-    def __init__(self, base_url: str = "https://api.comlaude.com", api_key: str = ""):
-        self.base_url = base_url
-        self.api_key = api_key
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-    
-    async def make_request(self, method: str, endpoint: str, params: Dict = None, data: Dict = None) -> Dict:
-        """Make HTTP request to Com Laude API"""
-        url = urljoin(self.base_url, endpoint)
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=self.headers,
-                    params=params,
-                    json=data
-                )
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
-                raise
-            except httpx.RequestError as e:
-                logger.error(f"Request error: {e}")
-                raise
 
-# Global API client instance
-api_client = ComLaudeAPIClient()
+class APIConfigurationError(RuntimeError):
+    """Raised when the API client is not properly configured."""
+
+
+@dataclass
+class APIConfigSnapshot:
+    base_url: str
+    api_key: str
+
+
+class APISettingsManager:
+    """Manage shared API configuration with async safety."""
+
+    def __init__(self, base_url: str, api_key: Optional[str] = None) -> None:
+        self._base_url = base_url
+        self._api_key = api_key.strip() if api_key else None
+        self._lock = asyncio.Lock()
+
+    async def update(self, *, api_key: str, base_url: Optional[str] = None) -> None:
+        cleaned_key = api_key.strip()
+        if not cleaned_key:
+            raise APIConfigurationError("API key cannot be empty. Provide a valid Com Laude API key.")
+
+        async with self._lock:
+            self._api_key = cleaned_key
+            if base_url:
+                cleaned_url = base_url.strip()
+                if cleaned_url:
+                    parsed_url = urlparse(cleaned_url)
+                    if not all([parsed_url.scheme, parsed_url.netloc]):
+                        raise APIConfigurationError(f"Invalid base_url: {base_url}")
+                    self._base_url = cleaned_url
+
+    async def snapshot(self) -> APIConfigSnapshot:
+        async with self._lock:
+            if not self._api_key:
+                raise APIConfigurationError(
+                    "API key is not configured. Set the COMLAUDE_API_KEY environment variable or use the configure_api tool to set it."
+                )
+            return APIConfigSnapshot(base_url=self._base_url, api_key=self._api_key)
+
+class ComLaudeAPIClient:
+    """Client for Com Laude API operations."""
+
+    def __init__(
+        self,
+        settings: APISettingsManager,
+        *,
+        default_timeout: float = 30.0,
+        max_retries: int = 5,
+        backoff_factor: float = 1.0,
+    ) -> None:
+        self._settings = settings
+        self._default_timeout = default_timeout
+        self._max_retries = max_retries
+        self._backoff_factor = backoff_factor
+
+    def update_defaults(
+        self,
+        *,
+        default_timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        backoff_factor: Optional[float] = None,
+    ) -> None:
+        if default_timeout is not None:
+            if default_timeout <= 0:
+                raise ValueError("Default timeout must be greater than zero seconds.")
+            self._default_timeout = default_timeout
+
+        if max_retries is not None:
+            if max_retries < 0:
+                raise ValueError("Max retries cannot be negative.")
+            self._max_retries = max_retries
+
+        if backoff_factor is not None:
+            if backoff_factor < 0:
+                raise ValueError("Backoff factor cannot be negative.")
+            self._backoff_factor = backoff_factor
+
+    def get_defaults(self) -> Dict[str, Any]:
+        return {
+            "timeout": self._default_timeout,
+            "max_retries": self._max_retries,
+            "backoff_factor": self._backoff_factor,
+        }
+
+    async def make_request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Make HTTP request to Com Laude API with validation and retries."""
+
+        config = await self._settings.snapshot()
+        url = urljoin(config.base_url, endpoint)
+
+        client_timeout = timeout if timeout is not None else self._default_timeout
+        if client_timeout <= 0:
+            raise ValueError("Timeout must be greater than zero seconds.")
+
+        headers = {
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        attempt = 0
+        last_error: Optional[Exception] = None
+
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
+            while attempt <= self._max_retries:
+                try:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        params=params,
+                        json=data,
+                    )
+                    response.raise_for_status()
+                    if response.headers.get("Content-Type", "").startswith("application/json"):
+                        return response.json()
+                    return response.text
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    if status == 401:
+                        logger.error("Received 401 Unauthorized from Com Laude API. Verify API key.")
+                        raise APIConfigurationError("Unauthorized: check API key permissions and validity.") from exc
+
+                    if status == 429 and attempt < self._max_retries:
+                        backoff_seconds = self._backoff_factor * (2 ** attempt)
+                        logger.warning(
+                            "Received 429 Too Many Requests. Retrying in %.2f seconds (attempt %d/%d).",
+                            backoff_seconds,
+                            attempt + 1,
+                            self._max_retries,
+                        )
+                        await asyncio.sleep(backoff_seconds)
+                        attempt += 1
+                        continue
+
+                    masked_body = "<omitted>" if exc.response.content else ""
+                    logger.error(
+                        "HTTP error %s from Com Laude API: %s", status, masked_body
+                    )
+                    raise
+                except httpx.RequestError as exc:
+                    last_error = exc
+                    if attempt < self._max_retries:
+                        backoff_seconds = self._backoff_factor * (2 ** attempt)
+                        logger.warning(
+                            "Request error: %s. Retrying in %.2f seconds (attempt %d/%d).",
+                            exc,
+                            backoff_seconds,
+                            attempt + 1,
+                            self._max_retries,
+                        )
+                        await asyncio.sleep(backoff_seconds)
+                        attempt += 1
+                        continue
+                    logger.error("Request error after retries: %s", exc)
+                    raise
+
+        if last_error:
+            raise last_error
+
+        raise RuntimeError("Unexpected request failure without captured exception.")
+
+
+default_settings = APISettingsManager(
+    base_url=os.getenv("COMLAUDE_BASE_URL", "https://api.comlaude.com"),
+    api_key=os.getenv("COMLAUDE_API_KEY"),
+)
+
+api_client = ComLaudeAPIClient(default_settings)
 
 # Initialize MCP server
 server = Server("comlaude-api")
@@ -105,6 +253,38 @@ async def handle_list_resources() -> List[Resource]:
             mimeType="application/json"
         )
     ]
+
+
+RESOURCE_CONTENT_TEMPLATES: Dict[str, str] = {
+    "comlaude://accounts": (
+        "Use tools like get_accounts, get_account, update_account, and search_accounts to "
+        "retrieve and manage account information."
+    ),
+    "comlaude://domains": (
+        "Use get_domains and get_domain tools to inspect domain registrations and DNS details."
+    ),
+    "comlaude://ssl-certificates": (
+        "Use get_ssl_certificates to list certificates with pagination support."
+    ),
+    "comlaude://contacts": (
+        "Use get_contacts to list and page through contact information."
+    ),
+    "comlaude://services": (
+        "Use get_services to view available services for a group."
+    ),
+}
+
+
+@server.read_resource()
+async def handle_read_resource(request: ReadResourceRequest) -> ResourceContents:
+    """Provide guidance for static resources."""
+    description = RESOURCE_CONTENT_TEMPLATES.get(request.uri)
+    if not description:
+        raise ValueError(f"Unknown resource URI: {request.uri}")
+
+    return ResourceContents(contents=[
+        TextContent(type="text", text=description)
+    ])
 
 @server.list_tools()
 async def handle_list_tools() -> List[Tool]:
@@ -266,6 +446,11 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "integer",
                         "description": "Maximum number of results",
                         "default": 50
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Page number",
+                        "default": 1
                     }
                 },
                 "required": ["group_id"]
@@ -323,6 +508,20 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "API base URL",
                         "default": "https://api.comlaude.com"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Default request timeout in seconds"
+                    },
+                    "max_retries": {
+                        "type": "integer",
+                        "description": "Maximum retry attempts for transient errors",
+                        "default": 5
+                    },
+                    "backoff_factor": {
+                        "type": "number",
+                        "description": "Backoff factor (seconds) for retry delays",
+                        "default": 1.0
                     }
                 },
                 "required": ["api_key"]
@@ -330,18 +529,48 @@ async def handle_list_tools() -> List[Tool]:
         )
     ]
 
+def _create_error_response(message: str, error_type: str = "error") -> List[TextContent]:
+    """Create a structured JSON error response."""
+    return [TextContent(
+        type="text",
+        text=json.dumps({"error": {"type": error_type, "message": message}}, indent=2)
+    )]
+
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
     """Handle tool calls"""
     try:
         if name == "configure_api":
-            global api_client
             api_key = arguments.get("api_key")
-            base_url = arguments.get("base_url", "https://api.comlaude.com")
-            api_client = ComLaudeAPIClient(base_url=base_url, api_key=api_key)
+            base_url = arguments.get("base_url")
+            if api_key is None:
+                raise APIConfigurationError("api_key is required for configure_api")
+
+            if base_url:
+                await default_settings.update(api_key=api_key, base_url=base_url)
+            else:
+                await default_settings.update(api_key=api_key)
+
+            timeout = arguments.get("timeout")
+            max_retries = arguments.get("max_retries")
+            backoff_factor = arguments.get("backoff_factor")
+
+            api_client.update_defaults(
+                default_timeout=timeout,
+                max_retries=max_retries,
+                backoff_factor=backoff_factor,
+            )
+
+            snapshot = await default_settings.snapshot()
+            defaults = api_client.get_defaults()
             return [TextContent(
                 type="text",
-                text=f"API client configured with base URL: {base_url}"
+                text=(
+                    "API client configured. "
+                    f"Base URL: {snapshot.base_url}. Timeout={defaults['timeout']}s, "
+                    f"max_retries={defaults['max_retries']}, "
+                    f"backoff_factor={defaults['backoff_factor']}"
+                )
             )]
         
         elif name == "get_accounts":
@@ -464,8 +693,12 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
         elif name == "get_ssl_certificates":
             group_id = arguments["group_id"]
             limit = arguments.get("limit", 50)
+            page = arguments.get("page", 1)
             
-            params = {"limit": limit}
+            params = {
+                "limit": limit,
+                "page": page
+            }
             
             result = await api_client.make_request(
                 "GET",
@@ -513,17 +746,14 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
             )]
         
         else:
-            return [TextContent(
-                type="text",
-                text=f"Unknown tool: {name}"
-            )]
+            return _create_error_response(f"Unknown tool: {name}", error_type="unknown_tool")
+    except APIConfigurationError as e:
+        logger.error(f"API Configuration Error calling tool {name}: {e}")
+        return _create_error_response(str(e), error_type="configuration_error")
     
     except Exception as e:
         logger.error(f"Error calling tool {name}: {e}")
-        return [TextContent(
-            type="text",
-            text=f"Error: {str(e)}"
-        )]
+        return _create_error_response(f"An unexpected error occurred: {str(e)}")
 
 async def main():
     """Main entry point"""

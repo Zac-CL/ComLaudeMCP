@@ -121,7 +121,10 @@ Once connected, you can use the tools through your MCP client. For example:
      "tool": "configure_api",
      "arguments": {
        "api_key": "your_api_key_here",
-       "base_url": "https://api.comlaude.com"
+       "base_url": "https://api.comlaude.com",
+       "timeout": 30,
+       "max_retries": 2,
+       "backoff_factor": 0.5
      }
    }
    ```

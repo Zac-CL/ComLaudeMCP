@@ -28,20 +28,13 @@ def test_imports():
 def test_basic_functionality():
     """Test basic server functionality"""
     try:
-        from mcp_server import ComLaudeAPIClient
+        from mcp_server import ComLaudeAPIClient, APISettingsManager
         
         # Test client initialization
-        client = ComLaudeAPIClient("https://api.comlaude.com", "test_key")
+        settings = APISettingsManager("https://api.comlaude.com", "test_key")
+        client = ComLaudeAPIClient(settings)
         print("✓ ComLaudeAPIClient initialized successfully")
         
-        # Test headers
-        expected_auth = "Bearer test_key"
-        if client.headers.get("Authorization") == expected_auth:
-            print("✓ Authorization header set correctly")
-        else:
-            print("✗ Authorization header not set correctly")
-            return False
-            
         return True
     except Exception as e:
         print(f"✗ Failed basic functionality test: {e}")
@@ -50,9 +43,10 @@ def test_basic_functionality():
 async def test_async_functionality():
     """Test async functionality"""
     try:
-        from mcp_server import ComLaudeAPIClient
+        from mcp_server import ComLaudeAPIClient, APISettingsManager
         
-        client = ComLaudeAPIClient("https://httpbin.org", "test_key")
+        settings = APISettingsManager("https://httpbin.org", "test_key")
+        client = ComLaudeAPIClient(settings)
         
         # Test a simple request (using httpbin.org for testing)
         try:
@@ -64,6 +58,34 @@ async def test_async_functionality():
             return False
     except Exception as e:
         print(f"✗ Failed async functionality test: {e}")
+        return False
+
+def test_error_handling():
+    """Test error handling"""
+    try:
+        from mcp_server import _create_error_response
+        
+        error_message = "Test error"
+        error_type = "test_error"
+        
+        response = _create_error_response(error_message, error_type)
+        
+        try:
+            error_json = json.loads(response[0].text)
+            if "error" in error_json and \
+               error_json["error"]["type"] == error_type and \
+               error_json["error"]["message"] == error_message:
+                print("✓ Error handling test passed")
+                return True
+            else:
+                print("✗ Error handling test failed: JSON structure is incorrect")
+                return False
+        except json.JSONDecodeError:
+            print("✗ Error handling test failed: Invalid JSON response")
+            return False
+            
+    except Exception as e:
+        print(f"✗ Failed error handling test: {e}")
         return False
 
 def main():
@@ -90,6 +112,11 @@ def main():
             sys.exit(1)
     except Exception as e:
         print(f"\n❌ Async test error: {e}")
+        sys.exit(1)
+    
+    # Test error handling
+    if not test_error_handling():
+        print("\n❌ Error handling tests failed")
         sys.exit(1)
     
     print("\n✅ All tests passed! The MCP server is ready to use.")
